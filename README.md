@@ -3,8 +3,10 @@
 Move a file somewhere else and leave a small encrypted record in its place. The
 record holds everything needed to get the file back.
 
-``` $ offloader push bigfile.iso offloaded bigfile.iso -> bigfile.iso.offload
-(id 3f9c…) $ offloader pull bigfile.iso.offload restored bigfile.iso ```
+```
+$ offloader push bigfile.iso offloaded bigfile.iso -> bigfile.iso.offload
+(id 3f9c…) $ offloader pull bigfile.iso.offload restored bigfile.iso 
+```
 
 The file is encrypted before it leaves the machine, so the remote only ever
 stores ciphertext. The `.offload` record is encrypted with your passphrase.
