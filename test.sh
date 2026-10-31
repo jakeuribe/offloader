@@ -38,4 +38,30 @@ OFFLOADER_METHOD=dir "$BIN" push "$T/h" --dir "$T/nas" --ext vault
 cmp "$T/h" "$T/orig"
 ! OFFLOADER_METHOD=dir "$BIN" push "$T/h" --dir relative 2>/dev/null   # relative dir rejected
 ! "$BIN" push "$T/h" --bogus x 2>/dev/null
+# --purge: dir method removes the remote blob
+cp "$T/orig" "$T/p"
+OFFLOADER_METHOD=dir "$BIN" push "$T/p" --dir "$T/nas"
+n=$(ls "$T/nas" | wc -l)
+"$BIN" pull "$T/p.offload" --purge
+cmp "$T/p" "$T/orig" && [ "$(ls "$T/nas" | wc -l)" -eq $((n - 1)) ]
+! OFFLOADER_METHOD=dir "$BIN" push "$T/p" --dir "$T/nas" --rm true 2>/dev/null   # --rm invalid for dir
+
+# --purge: shell method uses the --rm stored at push
+rm -rf "$T/remote"; mkdir "$T/remote"
+"$BIN" push "$T/p" --rm "rm '$T/remote/'\$ID"
+"$BIN" pull "$T/p.offload" --purge
+cmp "$T/p" "$T/orig" && [ -z "$(ls "$T/remote")" ]
+
+# --purge without any rm cmd fails up front: nothing restored, record kept
+"$BIN" push "$T/p"
+! "$BIN" pull "$T/p.offload" --purge 2>/dev/null
+[ -e "$T/p.offload" ] && [ ! -e "$T/p" ]
+# ...and --rm at pull time supplies it
+"$BIN" pull "$T/p.offload" --purge --rm "rm '$T/remote/'\$ID"
+cmp "$T/p" "$T/orig" && [ -z "$(ls "$T/remote")" ]
+
+# failing rm: file still restored, error reported
+"$BIN" push "$T/p" --rm false
+! "$BIN" pull "$T/p.offload" --purge 2>/dev/null
+cmp "$T/p" "$T/orig" && [ ! -e "$T/p.offload" ] && [ -n "$(ls "$T/remote")" ]
 echo PASS

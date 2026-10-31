@@ -1,8 +1,8 @@
 //! offloader: move a file elsewhere, leave an encrypted retrieval record in its place.
 //!
 //!   offloader push <file> [--method dir|shell] [--dir PATH] [--put CMD --get CMD]
-//!                         [--ext EXT] [--tmp PATH] [--no-verify]
-//!   offloader pull <file.EXT> [--ext EXT] [--tmp PATH]
+//!                         [--rm CMD] [--ext EXT] [--tmp PATH] [--no-verify]
+//!   offloader pull <file.EXT> [--purge] [--rm CMD] [--ext EXT] [--tmp PATH]
 //!
 //! Every flag falls back to an env var (see `Flag::env`).
 //!
@@ -11,6 +11,10 @@
 //!   shell – run user commands under `sh -c` with $SRC / $DST / $ID in the env.
 //!           Values go via env, never spliced into the command, so filenames can't inject.
 //!           e.g. --put 'rclone copyto "$SRC" r:b/$ID' --get 'rclone copyto r:b/$ID "$DST"'
+//!                --rm 'rclone deletefile r:b/$ID'
+//!
+//! `--purge` on pull deletes the remote copy after a successful restore. For shell, the
+//! `--rm` command given at push is stored in the record; `--rm` at pull overrides it.
 //!
 //! The file is age/X25519-encrypted with a fresh key before leaving the machine; the
 //! record (key, id, method) is age/scrypt-encrypted with your passphrase.
@@ -43,6 +47,9 @@ mod vocab {
     pub const PROMPT_PASS: &str = "record passphrase: ";
     pub const PROMPT_CONFIRM: &str = "confirm passphrase: ";
     pub const ENV_PASSPHRASE: &str = "OFFLOADER_PASSPHRASE";
+    /// Accepted (case-insensitive) values for on/off env vars.
+    pub const SWITCH_ON: [&str; 4] = ["1", "true", "yes", "on"];
+    pub const SWITCH_OFF: [&str; 5] = ["", "0", "false", "no", "off"];
 }
 use vocab::*;
 
@@ -78,14 +85,18 @@ enum Flag {
     Dir,
     Put,
     Get,
+    Rm,
     Ext,
     Tmp,
     NoVerify,
+    Purge,
+    NoPurge,
     Help,
 }
 impl Flag {
-    const ALL: [Flag; 8] = [
-        Self::Method, Self::Dir, Self::Put, Self::Get, Self::Ext, Self::Tmp, Self::NoVerify, Self::Help,
+    const ALL: [Flag; 11] = [
+        Self::Method, Self::Dir, Self::Put, Self::Get, Self::Rm, Self::Ext, Self::Tmp, Self::NoVerify, Self::Purge,
+        Self::NoPurge, Self::Help,
     ];
     fn name(self) -> &'static str {
         match self {
@@ -93,9 +104,12 @@ impl Flag {
             Self::Dir => "--dir",
             Self::Put => "--put",
             Self::Get => "--get",
+            Self::Rm => "--rm",
             Self::Ext => "--ext",
             Self::Tmp => "--tmp",
             Self::NoVerify => "--no-verify",
+            Self::Purge => "--purge",
+            Self::NoPurge => "--no-purge",
             Self::Help => "--help",
         }
     }
@@ -105,14 +119,16 @@ impl Flag {
             Self::Dir => Some("OFFLOADER_DIR"),
             Self::Put => Some("OFFLOADER_PUT"),
             Self::Get => Some("OFFLOADER_GET"),
+            Self::Rm => Some("OFFLOADER_RM"),
             Self::Ext => Some("OFFLOADER_EXT"),
             Self::Tmp => Some("OFFLOADER_TMP"),
             Self::NoVerify => Some("OFFLOADER_NO_VERIFY"),
-            Self::Help => None,
+            Self::Purge => Some("OFFLOADER_PURGE"),
+            Self::NoPurge | Self::Help => None,
         }
     }
     fn takes_value(self) -> bool {
-        !matches!(self, Self::NoVerify | Self::Help)
+        !matches!(self, Self::NoVerify | Self::Purge | Self::NoPurge | Self::Help)
     }
     fn parse(s: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|f| f.name() == s)
@@ -145,7 +161,7 @@ impl FromStr for MethodKind {
 /// How a blob gets out and back. Stored in the record.
 enum Method {
     Dir(PathBuf),
-    Shell { put: String, get: String },
+    Shell { put: String, get: String, rm: Option<String> },
 }
 
 /// Env vars exposed to shell commands.
@@ -174,9 +190,10 @@ enum Field {
     Method,
     Dir,
     Get,
+    Rm,
 }
 impl Field {
-    const ALL: [Field; 6] = [Self::Magic, Self::Id, Self::Key, Self::Method, Self::Dir, Self::Get];
+    const ALL: [Field; 7] = [Self::Magic, Self::Id, Self::Key, Self::Method, Self::Dir, Self::Get, Self::Rm];
     fn name(self) -> &'static str {
         match self {
             Self::Magic => "magic",
@@ -185,6 +202,7 @@ impl Field {
             Self::Method => "method",
             Self::Dir => "dir",
             Self::Get => "get",
+            Self::Rm => "rm",
         }
     }
 }
@@ -203,6 +221,8 @@ enum Error {
     Rng(String),
     CommandFailed { cmd: String, status: ExitStatus },
     VerifyMismatch,
+    NoRemover,
+    RemoteKept { id: String, cause: Box<Error> },
     Record(&'static str),
     BadValue { what: &'static str, why: &'static str },
 }
@@ -221,6 +241,8 @@ impl fmt::Display for Error {
             Self::Rng(e) => write!(f, "rng: {e}"),
             Self::CommandFailed { cmd, status } => write!(f, "command failed ({status}): {cmd}"),
             Self::VerifyMismatch => write!(f, "verify failed: fetched copy differs; original untouched"),
+            Self::NoRemover => write!(f, "{} with shell method needs {} (at push or pull)", Flag::Purge.name(), Flag::Rm.name()),
+            Self::RemoteKept { id, cause } => write!(f, "file restored, but remote copy {id} was not removed: {cause}"),
             Self::Record(m) => write!(f, "bad record: {m}"),
             Self::BadValue { what, why } => write!(f, "{what}: {why}"),
         }
@@ -251,6 +273,7 @@ struct Config {
     ext: String,
     tmp_root: PathBuf,
     verify: bool,
+    purge: bool,
     values: Vec<(Flag, String)>,
 }
 impl Config {
@@ -278,6 +301,7 @@ impl Config {
             ext: String::new(),
             tmp_root: PathBuf::new(),
             verify: true,
+            purge: false,
             values,
         };
         c.ext = c.get(Flag::Ext).unwrap_or_else(|| DEFAULT_EXT.into());
@@ -285,7 +309,14 @@ impl Config {
             return Err(Error::BadValue { what: Flag::Ext.name(), why: "must be non-empty, no '/' or '.'" });
         }
         c.tmp_root = c.get(Flag::Tmp).map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-        c.verify = c.get(Flag::NoVerify).is_none();
+        c.verify = !c.switch(Flag::NoVerify)?;
+        c.purge = match (c.on_cli(Flag::Purge), c.on_cli(Flag::NoPurge)) {
+            (true, true) => {
+                return Err(Error::Usage(format!("{} and {} conflict", Flag::Purge.name(), Flag::NoPurge.name())));
+            }
+            (_, true) => false,
+            _ => c.switch(Flag::Purge)?,
+        };
         Ok(Some(c))
     }
 
@@ -298,6 +329,26 @@ impl Config {
             .map(|(_, v)| v.clone())
             .or_else(|| f.env().and_then(|e| std::env::var(e).ok()))
     }
+    fn on_cli(&self, f: Flag) -> bool {
+        self.values.iter().any(|(k, _)| *k == f)
+    }
+
+    /// On/off flag: present on the CLI = on; else its env var must be a SWITCH_ON/OFF word.
+    fn switch(&self, f: Flag) -> R<bool> {
+        if self.on_cli(f) {
+            return Ok(true);
+        }
+        let Some(v) = f.env().and_then(|e| std::env::var(e).ok()) else { return Ok(false) };
+        let v = v.to_ascii_lowercase();
+        if SWITCH_ON.contains(&v.as_str()) {
+            Ok(true)
+        } else if SWITCH_OFF.contains(&v.as_str()) {
+            Ok(false)
+        } else {
+            Err(Error::BadValue { what: f.env().unwrap_or_default(), why: "expected 1/0, true/false, yes/no, on/off" })
+        }
+    }
+
     fn need(&self, f: Flag) -> R<String> {
         self.get(f).ok_or_else(|| {
             Error::Usage(format!("missing {} (or ${})", f.name(), f.env().unwrap_or_default()))
@@ -307,8 +358,13 @@ impl Config {
     fn method(&self) -> R<Method> {
         let kind: MethodKind = self.get(Flag::Method).as_deref().unwrap_or(MethodKind::Shell.name()).parse()?;
         let m = match kind {
+            MethodKind::Dir if self.get(Flag::Rm).is_some() => {
+                return Err(Error::BadValue { what: Flag::Rm.name(), why: "only applies to the shell method" });
+            }
             MethodKind::Dir => Method::Dir(self.need(Flag::Dir)?.into()),
-            MethodKind::Shell => Method::Shell { put: self.need(Flag::Put)?, get: self.need(Flag::Get)? },
+            MethodKind::Shell => {
+                Method::Shell { put: self.need(Flag::Put)?, get: self.need(Flag::Get)?, rm: self.get(Flag::Rm) }
+            }
         };
         m.validate()?;
         Ok(m)
@@ -343,8 +399,8 @@ impl Method {
                 Some(_) if !d.is_dir() => bad(Flag::Dir.name(), "is not a directory"),
                 Some(_) => Ok(()),
             },
-            Self::Shell { put, get } => {
-                if put.contains('\n') || get.contains('\n') {
+            Self::Shell { put, get, rm } => {
+                if [put, get].into_iter().chain(rm).any(|c| c.contains('\n')) {
                     bad("shell command", "must not contain newlines")
                 } else {
                     Ok(())
@@ -371,6 +427,18 @@ impl Method {
                 Ok(())
             }
             Self::Shell { get, .. } => sh(get, &[(ShellVar::Dst, dst.as_os_str()), (ShellVar::Id, id.as_ref())]),
+        }
+    }
+
+    fn can_remove(&self) -> bool {
+        matches!(self, Self::Dir(_) | Self::Shell { rm: Some(_), .. })
+    }
+
+    fn remove(&self, id: &str) -> R<()> {
+        match self {
+            Self::Dir(d) => Ok(fs::remove_file(d.join(id))?),
+            Self::Shell { rm: Some(rm), .. } => sh(rm, &[(ShellVar::Id, id.as_ref())]),
+            Self::Shell { rm: None, .. } => Err(Error::NoRemover),
         }
     }
 }
@@ -406,7 +474,10 @@ impl Record {
         match &self.method {
             // validate() guaranteed UTF-8.
             Method::Dir(d) => lines.push((Field::Dir, d.to_string_lossy().into_owned())),
-            Method::Shell { get, .. } => lines.push((Field::Get, get.clone())),
+            Method::Shell { get, rm, .. } => {
+                lines.push((Field::Get, get.clone()));
+                lines.extend(rm.clone().map(|r| (Field::Rm, r)));
+            }
         }
         lines
             .iter()
@@ -434,7 +505,11 @@ impl Record {
         let method = match field(Field::Method)?.parse::<MethodKind>().map_err(|_| Error::Record("unknown method"))? {
             MethodKind::Dir => Method::Dir(field(Field::Dir)?.into()),
             // put isn't needed to retrieve, so it isn't stored.
-            MethodKind::Shell => Method::Shell { put: String::new(), get: field(Field::Get)?.into() },
+            MethodKind::Shell => Method::Shell {
+                put: String::new(),
+                get: field(Field::Get)?.into(),
+                rm: field(Field::Rm).ok().map(String::from),
+            },
         };
         Ok(Self { id, key, method })
     }
@@ -495,7 +570,15 @@ fn pull(cfg: &Config) -> R<()> {
     age::Decryptor::new(BufReader::new(File::open(record_path)?))?
         .decrypt(std::iter::once(&age::scrypt::Identity::new(pass) as _))?
         .read_to_string(&mut body)?;
-    let rec = Record::decode(&body)?;
+    let mut rec = Record::decode(&body)?;
+    if let (Method::Shell { rm, .. }, Some(over)) = (&mut rec.method, cfg.get(Flag::Rm)) {
+        *rm = Some(over);
+        rec.method.validate()?;
+    }
+    // Fail before touching anything if purge can't be honored.
+    if cfg.purge && !rec.method.can_remove() {
+        return Err(Error::NoRemover);
+    }
 
     let tmp = TmpDir::new(&cfg.tmp_root, &rec.id)?;
     let blob = tmp.0.join(BLOB_NAME);
@@ -516,8 +599,12 @@ fn pull(cfg: &Config) -> R<()> {
     }
     fs::rename(&partial, &out)?;
     fs::remove_file(record_path)?;
-    // ponytail: remote copy is kept; add a delete op to Method if pull should remove it.
     println!("restored {}", out.display());
+    // Only after the plaintext is safely in place.
+    if cfg.purge {
+        rec.method.remove(&rec.id).map_err(|e| Error::RemoteKept { id: rec.id.clone(), cause: Box::new(e) })?;
+        println!("removed remote copy {}", rec.id);
+    }
     Ok(())
 }
 
