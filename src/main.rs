@@ -23,10 +23,11 @@ use age::secrecy::{ExposeSecret, SecretString};
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::str::FromStr;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Fixed vocabulary: every name the program knows lives here.
 mod vocab {
@@ -44,6 +45,9 @@ mod vocab {
     pub const COMPARE_BUF: usize = 64 * 1024;
     pub const PRIVATE_FILE_MODE: u32 = 0o600;
     pub const PRIVATE_DIR_MODE: u32 = 0o700;
+    /// Permission bits carried in the record (rwx for u/g/o + setuid/setgid/sticky).
+    pub const MODE_MASK: u32 = 0o7777;
+    pub const MODE_RADIX: u32 = 8;
     pub const PROMPT_PASS: &str = "record passphrase: ";
     pub const PROMPT_CONFIRM: &str = "confirm passphrase: ";
     pub const ENV_PASSPHRASE: &str = "OFFLOADER_PASSPHRASE";
@@ -191,9 +195,15 @@ enum Field {
     Dir,
     Get,
     Rm,
+    Mode,
+    Mtime,
+    Atime,
 }
 impl Field {
-    const ALL: [Field; 7] = [Self::Magic, Self::Id, Self::Key, Self::Method, Self::Dir, Self::Get, Self::Rm];
+    const ALL: [Field; 10] = [
+        Self::Magic, Self::Id, Self::Key, Self::Method, Self::Dir, Self::Get, Self::Rm, Self::Mode, Self::Mtime,
+        Self::Atime,
+    ];
     fn name(self) -> &'static str {
         match self {
             Self::Magic => "magic",
@@ -203,6 +213,9 @@ impl Field {
             Self::Dir => "dir",
             Self::Get => "get",
             Self::Rm => "rm",
+            Self::Mode => "mode",
+            Self::Mtime => "mtime",
+            Self::Atime => "atime",
         }
     }
 }
@@ -462,6 +475,71 @@ struct Record {
     id: String,
     key: age::x25519::Identity,
     method: Method,
+    meta: Meta,
+}
+
+/// Original file metadata, restored on pull. Optional so older records still decode
+/// (missing fields leave the restored file at the private defaults).
+/// Owner isn't stored: only root could restore it, and pull runs as the user.
+#[derive(Default)]
+struct Meta {
+    mode: Option<u32>,
+    mtime: Option<SystemTime>,
+    atime: Option<SystemTime>,
+}
+impl Meta {
+    fn of(m: &fs::Metadata) -> Self {
+        Self { mode: Some(m.permissions().mode() & MODE_MASK), mtime: m.modified().ok(), atime: m.accessed().ok() }
+    }
+
+    /// Apply to an open file; call after the last write so mtime sticks.
+    fn apply(&self, f: &File) -> io::Result<()> {
+        if let Some(mode) = self.mode {
+            f.set_permissions(fs::Permissions::from_mode(mode))?;
+        }
+        let mut times = fs::FileTimes::new();
+        if let Some(t) = self.mtime {
+            times = times.set_modified(t);
+        }
+        if let Some(t) = self.atime {
+            times = times.set_accessed(t);
+        }
+        f.set_times(times)
+    }
+
+    fn encode(&self, lines: &mut Vec<(Field, String)>) {
+        lines.extend(self.mode.map(|m| (Field::Mode, format!("{m:o}"))));
+        lines.extend(self.mtime.map(|t| (Field::Mtime, time_to_nanos(t).to_string())));
+        lines.extend(self.atime.map(|t| (Field::Atime, time_to_nanos(t).to_string())));
+    }
+
+    fn decode<'a>(field: impl Fn(Field) -> Option<&'a str>) -> R<Self> {
+        let time = |f| {
+            field(f)
+                .map(|v| v.parse::<i128>().ok().and_then(nanos_to_time).ok_or(Error::Record("malformed time")))
+                .transpose()
+        };
+        let mode = field(Field::Mode)
+            .map(|v| match u32::from_str_radix(v, MODE_RADIX) {
+                Ok(m) if m & !MODE_MASK == 0 => Ok(m),
+                _ => Err(Error::Record("malformed mode")),
+            })
+            .transpose()?;
+        Ok(Self { mode, mtime: time(Field::Mtime)?, atime: time(Field::Atime)? })
+    }
+}
+
+/// Signed nanoseconds since the epoch (pre-1970 timestamps are legal on Unix).
+fn time_to_nanos(t: SystemTime) -> i128 {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i128,
+        Err(e) => -(e.duration().as_nanos() as i128),
+    }
+}
+
+fn nanos_to_time(n: i128) -> Option<SystemTime> {
+    let d = Duration::from_nanos(u64::try_from(n.unsigned_abs()).ok()?);
+    if n >= 0 { UNIX_EPOCH.checked_add(d) } else { UNIX_EPOCH.checked_sub(d) }
 }
 impl Record {
     fn encode(&self) -> SecretString {
@@ -479,6 +557,7 @@ impl Record {
                 lines.extend(rm.clone().map(|r| (Field::Rm, r)));
             }
         }
+        self.meta.encode(&mut lines);
         lines
             .iter()
             .map(|(k, v)| format!("{}{RECORD_SEP}{v}\n", k.name()))
@@ -511,7 +590,8 @@ impl Record {
                 rm: field(Field::Rm).ok().map(String::from),
             },
         };
-        Ok(Self { id, key, method })
+        let meta = Meta::decode(|f| field(f).ok())?;
+        Ok(Self { id, key, method, meta })
     }
 }
 
@@ -519,7 +599,8 @@ impl Record {
 
 fn push(cfg: &Config) -> R<()> {
     let file = &cfg.target;
-    if !fs::metadata(file)?.is_file() {
+    let file_meta = fs::metadata(file)?;
+    if !file_meta.is_file() {
         return Err(Error::NotRegularFile(file.clone()));
     }
     let record_path = cfg.record_path(file);
@@ -528,7 +609,7 @@ fn push(cfg: &Config) -> R<()> {
     }
     let method = cfg.method()?;
     let pass = passphrase(true)?;
-    let rec = Record { id: random_id()?, key: age::x25519::Identity::generate(), method };
+    let rec = Record { id: random_id()?, key: age::x25519::Identity::generate(), method, meta: Meta::of(&file_meta) };
     let tmp = TmpDir::new(&cfg.tmp_root, &rec.id)?;
 
     let blob = tmp.0.join(BLOB_NAME);
@@ -591,6 +672,7 @@ fn pull(cfg: &Config) -> R<()> {
     let res = (|| -> R<()> {
         let mut w = private_file(&partial)?;
         io::copy(&mut decrypt(&blob, &rec.key)?, &mut w)?;
+        rec.meta.apply(&w)?;
         Ok(w.sync_all()?)
     })();
     if let Err(e) = res {

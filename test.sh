@@ -78,4 +78,14 @@ rm -f "$T/remote"/*
 ! "$BIN" pull "$T/p.offload" --purge --no-purge 2>/dev/null       # conflict rejected
 OFFLOADER_PURGE=TRUE "$BIN" pull "$T/p.offload"
 cmp "$T/p" "$T/orig" && [ -z "$(ls "$T/remote")" ]               # default purge works
+# metadata: mode + mtime/atime survive the round trip (incl. read-only and pre-1970)
+unset OFFLOADER_PURGE
+for spec in "755 2001-02-03T04:05:06.123456789" "444 1960-01-01T00:00:00.5" "4750 2020-06-01T12:00:00"; do
+  set -- $spec
+  m="$T/meta"; cp "$T/orig" "$m"; chmod "$1" "$m"; touch -d "$2" "$m"
+  before=$(stat -c '%a %y %x' "$m")
+  "$BIN" push "$m" >/dev/null; "$BIN" pull "$m.offload" >/dev/null
+  [ "$(stat -c '%a %y %x' "$m")" = "$before" ] || { echo "meta mismatch: $before vs $(stat -c '%a %y %x' "$m")"; exit 1; }
+  cmp "$m" "$T/orig"; chmod u+w "$m"; rm -f "$m"
+done
 echo PASS
