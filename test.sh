@@ -64,4 +64,18 @@ cmp "$T/p" "$T/orig" && [ -z "$(ls "$T/remote")" ]
 "$BIN" push "$T/p" --rm false
 ! "$BIN" pull "$T/p.offload" --purge 2>/dev/null
 cmp "$T/p" "$T/orig" && [ ! -e "$T/p.offload" ] && [ -n "$(ls "$T/remote")" ]
+# purge as a default via env, --no-purge overrides, bad/zero values handled
+rm -rf "$T/remote"; mkdir "$T/remote"
+export OFFLOADER_RM="rm '$T/remote/'\$ID"
+"$BIN" push "$T/p"; OFFLOADER_PURGE=0 "$BIN" pull "$T/p.offload"
+[ -n "$(ls "$T/remote")" ]                                       # 0 means off
+rm -f "$T/remote"/*
+"$BIN" push "$T/p"; OFFLOADER_PURGE=yes "$BIN" pull "$T/p.offload" --no-purge
+[ -n "$(ls "$T/remote")" ]                                       # --no-purge wins
+rm -f "$T/remote"/*
+"$BIN" push "$T/p"
+! OFFLOADER_PURGE=maybe "$BIN" pull "$T/p.offload" 2>/dev/null   # junk rejected
+! "$BIN" pull "$T/p.offload" --purge --no-purge 2>/dev/null       # conflict rejected
+OFFLOADER_PURGE=TRUE "$BIN" pull "$T/p.offload"
+cmp "$T/p" "$T/orig" && [ -z "$(ls "$T/remote")" ]               # default purge works
 echo PASS
