@@ -54,8 +54,9 @@ remote:bucket/$ID' export OFFLOADER_GET='rclone copyto remote:bucket/$ID
 2. Uploads the blob.
 3. Verifies by downloading it back, decrypting it and comparing it byte for
    byte with the original. Skip this with `--no-verify`.
-4. Writes `<file>.offload` (the id, the key, and the get/rm commands or
-   directory, encrypted with your passphrase) and syncs it to disk.
+4. Writes `<file>.offload` (the id, the key, the get/rm commands or
+   directory, and the file's permission bits and mtime/atime, encrypted with
+   your passphrase) and syncs it to disk.
 5. Deletes the original, and only then.
 
 If any step fails, the original is left untouched.
@@ -64,7 +65,9 @@ If any step fails, the original is left untouched.
 1. Decrypts the record.
 2. Downloads the blob and decrypts it to `<file>-partial`. Decryption is
    authenticated, so any tampering or truncation fails here.
-3. Renames it to `<file>` and deletes the record.
+3. Restores the original permission bits (including setuid/setgid/sticky) and
+   mtime/atime, then renames it to `<file>` and deletes the record. The owner
+   isn't restored; the file belongs to whoever runs pull.
 4. With `--purge`, deletes the remote copy. If that fails, the file is still
    restored; offloader exits non-zero and prints the id that's left on the
    remote.
