@@ -1,0 +1,4 @@
+[advisories]
+# crypto-bigint 0.5 timing issue, via age -> p256. offloader only uses X25519 and
+# scrypt; no P-256 code is linked (checked with cargo bloat). Remove when age updates.
+ignore = ["RUSTSEC-2026-0387"]
