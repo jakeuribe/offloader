@@ -75,7 +75,8 @@ rm -f "$T/remote"/*
 rm -f "$T/remote"/*
 "$BIN" push "$T/p"
 ! OFFLOADER_PURGE=maybe "$BIN" pull "$T/p.offload" 2>/dev/null   # junk rejected
-! "$BIN" pull "$T/p.offload" --purge --no-purge 2>/dev/null       # conflict rejected
+"$BIN" pull "$T/p.offload" --purge --no-purge; [ -n "$(ls "$T/remote")" ]   # --no-purge always wins
+rm -f "$T/remote"/*; "$BIN" push "$T/p"
 OFFLOADER_PURGE=TRUE "$BIN" pull "$T/p.offload"
 cmp "$T/p" "$T/orig" && [ -z "$(ls "$T/remote")" ]               # default purge works
 # metadata: mode + mtime/atime survive the round trip (incl. read-only and pre-1970)

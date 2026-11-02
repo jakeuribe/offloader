@@ -2,8 +2,21 @@
 name = "offloader"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+license = "Apache-2.0"
+description = "Offload a file elsewhere and leave an encrypted retrieval record in its place"
+repository = "https://github.com/jakeuribe/offloader"
+readme = "README.md"
 
 [dependencies]
 age = "0.12"
+clap = { version = "4.6.7", default-features = false, features = ["std", "derive", "env", "help", "usage", "error-context", "suggestions", "color"] }
 getrandom = "0.4.3"
 rpassword = "7.5.4"
+tempfile = "3.27.0"
+thiserror = "2.0.21"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

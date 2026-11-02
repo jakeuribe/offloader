@@ -31,7 +31,7 @@ Every flag has an env fallback (`--put` → `OFFLOADER_PUT`, and so on).
 | `--method dir\|shell` | transport |
 | `--dir PATH` | target for `dir` |
 | `--put` / `--get` / `--rm CMD` | shell commands |
-| `--purge` / `--no-purge` | delete the remote copy after pull (`OFFLOADER_PURGE=1` makes it the default) |
+| `--purge` / `--no-purge` | delete the remote copy after pull (`OFFLOADER_PURGE=1` makes it the default); `--no-purge` always wins |
 | `--no-verify` | skip the round-trip check on push |
 | `--ext EXT`, `--tmp PATH` | record extension, scratch dir |
 
@@ -41,3 +41,7 @@ Every flag has an env fallback (`--put` → `OFFLOADER_PUT`, and so on).
 - Pull restores the mode and timestamps but not the owner.
 - One file at a time; `tar` directories first. Unix only.
 - Run the tests with `./test.sh`.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).

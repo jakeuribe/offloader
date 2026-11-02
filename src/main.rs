@@ -1,32 +1,18 @@
 //! offloader: move a file elsewhere, leave an encrypted retrieval record in its place.
 //!
-//!   offloader push <file> [--method dir|shell] [--dir PATH] [--put CMD --get CMD]
-//!                         [--rm CMD] [--ext EXT] [--tmp PATH] [--no-verify]
-//!   offloader pull <file.EXT> [--purge] [--rm CMD] [--ext EXT] [--tmp PATH]
-//!
-//! Every flag falls back to an env var (see `Flag::env`).
-//!
-//! Methods:
-//!   dir   – copy the encrypted blob into a directory (NAS mount, USB, …).
-//!   shell – run user commands under `sh -c` with $SRC / $DST / $ID in the env.
-//!           Values go via env, never spliced into the command, so filenames can't inject.
-//!           e.g. --put 'rclone copyto "$SRC" r:b/$ID' --get 'rclone copyto r:b/$ID "$DST"'
-//!                --rm 'rclone deletefile r:b/$ID'
-//!
-//! `--purge` on pull deletes the remote copy after a successful restore. For shell, the
-//! `--rm` command given at push is stored in the record; `--rm` at pull overrides it.
-//!
 //! The file is age/X25519-encrypted with a fresh key before leaving the machine; the
-//! record (key, id, method) is age/scrypt-encrypted with your passphrase.
+//! record (key, id, method, file metadata) is age/scrypt-encrypted with your passphrase.
+//! CLI surface lives in the clap structs below; `offloader --help` documents it.
 
 use age::secrecy::{ExposeSecret, SecretString};
-use std::fmt;
+use clap::builder::BoolishValueParser;
+use clap::error::ErrorKind;
+use clap::{ArgAction, Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
-use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Fixed vocabulary: every name the program knows lives here.
@@ -34,7 +20,8 @@ mod vocab {
     pub const PROGRAM: &str = "offloader";
     pub const RECORD_MAGIC: &str = "offloader-v1";
     pub const DEFAULT_EXT: &str = "offload";
-    pub const PARTIAL_SUFFIX: &str = "-partial";
+    /// Hidden temp file next to the restore target, renamed into place when complete.
+    pub const PARTIAL_PREFIX: &str = ".offloader-partial-";
     pub const TMP_PREFIX: &str = "offloader-";
     pub const BLOB_NAME: &str = "blob";
     pub const VERIFY_NAME: &str = "verify";
@@ -50,122 +37,220 @@ mod vocab {
     pub const MODE_RADIX: u32 = 8;
     pub const PROMPT_PASS: &str = "record passphrase: ";
     pub const PROMPT_CONFIRM: &str = "confirm passphrase: ";
-    pub const ENV_PASSPHRASE: &str = "OFFLOADER_PASSPHRASE";
-    /// Accepted (case-insensitive) values for on/off env vars.
-    pub const SWITCH_ON: [&str; 4] = ["1", "true", "yes", "on"];
-    pub const SWITCH_OFF: [&str; 5] = ["", "0", "false", "no", "off"];
+    pub const METHOD_DIR: &str = "dir";
+    pub const METHOD_SHELL: &str = "shell";
+
+    /// Long flag names (without the leading `--`).
+    pub mod flag {
+        pub const METHOD: &str = "method";
+        pub const DIR: &str = "dir";
+        pub const PUT: &str = "put";
+        pub const GET: &str = "get";
+        pub const RM: &str = "rm";
+        pub const EXT: &str = "ext";
+        pub const TMP: &str = "tmp";
+        pub const NO_VERIFY: &str = "no-verify";
+        pub const PURGE: &str = "purge";
+        pub const NO_PURGE: &str = "no-purge";
+    }
+
+    /// Env var fallbacks for flags, plus the passphrase.
+    pub mod env {
+        pub const METHOD: &str = "OFFLOADER_METHOD";
+        pub const DIR: &str = "OFFLOADER_DIR";
+        pub const PUT: &str = "OFFLOADER_PUT";
+        pub const GET: &str = "OFFLOADER_GET";
+        pub const RM: &str = "OFFLOADER_RM";
+        pub const EXT: &str = "OFFLOADER_EXT";
+        pub const TMP: &str = "OFFLOADER_TMP";
+        pub const NO_VERIFY: &str = "OFFLOADER_NO_VERIFY";
+        pub const PURGE: &str = "OFFLOADER_PURGE";
+        pub const PASSPHRASE: &str = "OFFLOADER_PASSPHRASE";
+    }
 }
 use vocab::*;
 
-// ---------- enums ----------
+// ---------- CLI ----------
 
-#[derive(Clone, Copy)]
+#[derive(Parser)]
+#[command(name = PROGRAM, version, about, after_help = after_help())]
+struct Cli {
+    #[command(flatten)]
+    common: Common,
+    #[command(subcommand)]
+    cmd: Cmd,
+}
+
+#[derive(Args)]
+struct Common {
+    /// Record file extension
+    #[arg(long = flag::EXT, env = env::EXT, default_value = DEFAULT_EXT, value_parser = parse_ext, global = true)]
+    ext: String,
+    /// Root for private scratch dirs
+    #[arg(long = flag::TMP, env = env::TMP, global = true, default_value_os_t = std::env::temp_dir())]
+    tmp: PathBuf,
+}
+
+#[derive(Subcommand)]
 enum Cmd {
-    Push,
-    Pull,
+    /// Encrypt + upload FILE, verify, then replace it with FILE.<ext>
+    Push(PushArgs),
+    /// Fetch + decrypt the file a record points to, restoring it in place
+    Pull(PullArgs),
 }
-impl Cmd {
-    const ALL: [Cmd; 2] = [Self::Push, Self::Pull];
-    fn name(self) -> &'static str {
-        match self {
-            Self::Push => "push",
-            Self::Pull => "pull",
-        }
-    }
+
+#[derive(Args)]
+struct PushArgs {
+    file: PathBuf,
+    /// How the blob leaves the machine
+    #[arg(id = flag::METHOD, long = flag::METHOD, env = env::METHOD, value_enum, default_value_t = MethodKind::Shell)]
+    method: MethodKind,
+    /// Target directory (absolute) for the dir method
+    #[arg(long = flag::DIR, env = env::DIR, value_parser = parse_dir, required_if_eq(flag::METHOD, METHOD_DIR))]
+    dir: Option<PathBuf>,
+    /// Upload command (shell method)
+    #[arg(long = flag::PUT, env = env::PUT, value_parser = parse_cmd)]
+    put: Option<String>,
+    /// Download command (shell method; stored in the record)
+    #[arg(long = flag::GET, env = env::GET, value_parser = parse_cmd)]
+    get: Option<String>,
+    /// Remove command for later purges (shell method; stored in the record)
+    #[arg(long = flag::RM, env = env::RM, value_parser = parse_cmd)]
+    rm: Option<String>,
+    /// Skip downloading the copy back to verify it before deleting the original
+    #[arg(long = flag::NO_VERIFY, env = env::NO_VERIFY, action = ArgAction::SetTrue, value_parser = BoolishValueParser::new())]
+    no_verify: bool,
 }
-impl FromStr for Cmd {
-    type Err = Error;
-    fn from_str(s: &str) -> Result<Self, Error> {
-        Self::ALL
-            .into_iter()
-            .find(|c| c.name() == s)
-            .ok_or_else(|| Error::Usage(format!("unknown command {s:?}")))
+
+#[derive(Args)]
+struct PullArgs {
+    record: PathBuf,
+    /// Delete the remote copy after a successful restore
+    #[arg(long = flag::PURGE, env = env::PURGE, action = ArgAction::SetTrue, value_parser = BoolishValueParser::new())]
+    purge: bool,
+    /// Keep the remote copy; always wins over --purge / $OFFLOADER_PURGE
+    #[arg(long = flag::NO_PURGE, action = ArgAction::SetTrue)]
+    no_purge: bool,
+    /// Remove command, overriding the one stored in the record (shell method)
+    #[arg(long = flag::RM, env = env::RM, value_parser = parse_cmd)]
+    rm: Option<String>,
+}
+
+fn parse_ext(s: &str) -> Result<String, String> {
+    if s.is_empty() || s.contains(['/', '.']) {
+        Err("must be non-empty, no '/' or '.'".into())
+    } else {
+        Ok(s.into())
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Flag {
-    Method,
-    Dir,
-    Put,
-    Get,
-    Rm,
-    Ext,
-    Tmp,
-    NoVerify,
-    Purge,
-    NoPurge,
-    Help,
-}
-impl Flag {
-    const ALL: [Flag; 11] = [
-        Self::Method, Self::Dir, Self::Put, Self::Get, Self::Rm, Self::Ext, Self::Tmp, Self::NoVerify, Self::Purge,
-        Self::NoPurge, Self::Help,
-    ];
-    fn name(self) -> &'static str {
-        match self {
-            Self::Method => "--method",
-            Self::Dir => "--dir",
-            Self::Put => "--put",
-            Self::Get => "--get",
-            Self::Rm => "--rm",
-            Self::Ext => "--ext",
-            Self::Tmp => "--tmp",
-            Self::NoVerify => "--no-verify",
-            Self::Purge => "--purge",
-            Self::NoPurge => "--no-purge",
-            Self::Help => "--help",
-        }
-    }
-    fn env(self) -> Option<&'static str> {
-        match self {
-            Self::Method => Some("OFFLOADER_METHOD"),
-            Self::Dir => Some("OFFLOADER_DIR"),
-            Self::Put => Some("OFFLOADER_PUT"),
-            Self::Get => Some("OFFLOADER_GET"),
-            Self::Rm => Some("OFFLOADER_RM"),
-            Self::Ext => Some("OFFLOADER_EXT"),
-            Self::Tmp => Some("OFFLOADER_TMP"),
-            Self::NoVerify => Some("OFFLOADER_NO_VERIFY"),
-            Self::Purge => Some("OFFLOADER_PURGE"),
-            Self::NoPurge | Self::Help => None,
-        }
-    }
-    fn takes_value(self) -> bool {
-        !matches!(self, Self::NoVerify | Self::Purge | Self::NoPurge | Self::Help)
-    }
-    fn parse(s: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|f| f.name() == s)
+/// Stored in the record and used from any cwd at pull time: absolute, UTF-8, one line.
+fn parse_dir(s: &str) -> Result<PathBuf, String> {
+    let p = PathBuf::from(s);
+    match () {
+        _ if s.contains('\n') => Err("must not contain newlines".into()),
+        _ if !p.is_absolute() => Err("must be absolute".into()),
+        _ if !p.is_dir() => Err("is not a directory".into()),
+        _ => Ok(p),
     }
 }
 
-#[derive(Clone, Copy)]
+/// Commands are stored as single record lines.
+fn parse_cmd(s: &str) -> Result<String, String> {
+    if s.contains('\n') {
+        Err("must not contain newlines".into())
+    } else {
+        Ok(s.into())
+    }
+}
+
+fn after_help() -> String {
+    format!(
+        "Shell commands run under `{SHELL} {SHELL_FLAG}` with ${}, ${}, ${} in the env.\nPassphrase: ${} or prompt.",
+        ShellVar::Src.name(),
+        ShellVar::Dst.name(),
+        ShellVar::Id.name(),
+        env::PASSPHRASE
+    )
+}
+
+impl Common {
+    fn record_path(&self, file: &Path) -> PathBuf {
+        let mut s = file.as_os_str().to_owned();
+        s.push(format!(".{}", self.ext));
+        s.into()
+    }
+}
+
+impl PushArgs {
+    /// `--dir` is enforced by clap's `required_if_eq` (dir is never the default method).
+    /// `--put`/`--get` are checked here: `required_if_eq` ignores default values, and shell
+    /// is the default. Errors go through clap so they look and exit like its own.
+    fn method(&self) -> R<Method> {
+        let cli_err = |kind, msg: String| Error::Cli(Cli::command().error(kind, msg));
+        let need = |v: &Option<String>, flag: &str, env: &str| {
+            v.clone().ok_or_else(|| {
+                cli_err(
+                    ErrorKind::MissingRequiredArgument,
+                    format!(
+                        "--{flag} (or ${env}) is required for --{} {METHOD_SHELL}",
+                        flag::METHOD
+                    ),
+                )
+            })
+        };
+        Ok(match self.method {
+            MethodKind::Dir if self.rm.is_some() => {
+                return Err(cli_err(
+                    ErrorKind::ArgumentConflict,
+                    format!(
+                        "--{} only applies to --{} {METHOD_SHELL}",
+                        flag::RM,
+                        flag::METHOD
+                    ),
+                ));
+            }
+            MethodKind::Dir => {
+                Method::Dir(self.dir.clone().expect("enforced by clap required_if_eq"))
+            }
+            MethodKind::Shell => Method::Shell {
+                put: need(&self.put, flag::PUT, env::PUT)?,
+                get: need(&self.get, flag::GET, env::GET)?,
+                rm: self.rm.clone(),
+            },
+        })
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum MethodKind {
+    /// Copy into a local directory (NAS mount, USB, …)
+    #[value(name = METHOD_DIR)]
     Dir,
+    /// Run user-supplied put/get/rm commands
+    #[value(name = METHOD_SHELL)]
     Shell,
 }
 impl MethodKind {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Dir => "dir",
-            Self::Shell => "shell",
-        }
+    fn name(self) -> String {
+        self.to_possible_value()
+            .expect("no skipped variants")
+            .get_name()
+            .to_owned()
     }
-}
-impl FromStr for MethodKind {
-    type Err = Error;
-    fn from_str(s: &str) -> Result<Self, Error> {
-        [Self::Dir, Self::Shell]
-            .into_iter()
-            .find(|m| m.name() == s)
-            .ok_or_else(|| Error::Usage(format!("unknown method {s:?}")))
+    fn parse(s: &str) -> Option<Self> {
+        <Self as ValueEnum>::from_str(s, false).ok()
     }
 }
 
 /// How a blob gets out and back. Stored in the record.
 enum Method {
     Dir(PathBuf),
-    Shell { put: String, get: String, rm: Option<String> },
+    Shell {
+        put: String,
+        get: String,
+        rm: Option<String>,
+    },
 }
 
 /// Env vars exposed to shell commands.
@@ -201,7 +286,15 @@ enum Field {
 }
 impl Field {
     const ALL: [Field; 10] = [
-        Self::Magic, Self::Id, Self::Key, Self::Method, Self::Dir, Self::Get, Self::Rm, Self::Mode, Self::Mtime,
+        Self::Magic,
+        Self::Id,
+        Self::Key,
+        Self::Method,
+        Self::Dir,
+        Self::Get,
+        Self::Rm,
+        Self::Mode,
+        Self::Mtime,
         Self::Atime,
     ];
     fn name(self) -> &'static str {
@@ -220,175 +313,40 @@ impl Field {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 enum Error {
-    Usage(String),
-    Io(io::Error),
-    Encrypt(age::EncryptError),
-    Decrypt(age::DecryptError),
+    #[error("io: {0}")]
+    Io(#[from] io::Error),
+    #[error("encrypt: {0}")]
+    Encrypt(#[from] age::EncryptError),
+    #[error("decrypt: {0}")]
+    Decrypt(#[from] age::DecryptError),
+    #[error("{} already exists", .0.display())]
     Exists(PathBuf),
+    #[error("{} is not a regular file", .0.display())]
     NotRegularFile(PathBuf),
+    #[error("expected a .{0} file")]
     WrongExtension(String),
+    #[error("empty passphrase")]
     EmptyPassphrase,
+    #[error("passphrases differ")]
     PassphraseMismatch,
+    #[error("rng: {0}")]
     Rng(String),
+    #[error("command failed ({status}): {cmd}")]
     CommandFailed { cmd: String, status: ExitStatus },
+    #[error("verify failed: fetched copy differs; original untouched")]
     VerifyMismatch,
+    #[error("--{purge} with the shell method needs --{rm} (at push or pull)", purge = flag::PURGE, rm = flag::RM)]
     NoRemover,
+    #[error("file restored, but remote copy {id} was not removed: {cause}")]
     RemoteKept { id: String, cause: Box<Error> },
+    #[error("bad record: {0}")]
     Record(&'static str),
-    BadValue { what: &'static str, why: &'static str },
-}
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            Self::Usage(m) => write!(f, "{m}\n\n{}", usage()),
-            Self::Io(e) => write!(f, "io: {e}"),
-            Self::Encrypt(e) => write!(f, "encrypt: {e}"),
-            Self::Decrypt(e) => write!(f, "decrypt: {e}"),
-            Self::Exists(p) => write!(f, "{} already exists", p.display()),
-            Self::NotRegularFile(p) => write!(f, "{} is not a regular file", p.display()),
-            Self::WrongExtension(e) => write!(f, "expected a .{e} file"),
-            Self::EmptyPassphrase => write!(f, "empty passphrase"),
-            Self::PassphraseMismatch => write!(f, "passphrases differ"),
-            Self::Rng(e) => write!(f, "rng: {e}"),
-            Self::CommandFailed { cmd, status } => write!(f, "command failed ({status}): {cmd}"),
-            Self::VerifyMismatch => write!(f, "verify failed: fetched copy differs; original untouched"),
-            Self::NoRemover => write!(f, "{} with shell method needs {} (at push or pull)", Flag::Purge.name(), Flag::Rm.name()),
-            Self::RemoteKept { id, cause } => write!(f, "file restored, but remote copy {id} was not removed: {cause}"),
-            Self::Record(m) => write!(f, "bad record: {m}"),
-            Self::BadValue { what, why } => write!(f, "{what}: {why}"),
-        }
-    }
-}
-impl From<io::Error> for Error {
-    fn from(e: io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-impl From<age::EncryptError> for Error {
-    fn from(e: age::EncryptError) -> Self {
-        Self::Encrypt(e)
-    }
-}
-impl From<age::DecryptError> for Error {
-    fn from(e: age::DecryptError) -> Self {
-        Self::Decrypt(e)
-    }
+    #[error(transparent)]
+    Cli(clap::Error),
 }
 type R<T> = Result<T, Error>;
-
-// ---------- config ----------
-
-struct Config {
-    cmd: Cmd,
-    target: PathBuf,
-    ext: String,
-    tmp_root: PathBuf,
-    verify: bool,
-    purge: bool,
-    values: Vec<(Flag, String)>,
-}
-impl Config {
-    fn parse(args: impl Iterator<Item = String>) -> R<Option<Self>> {
-        let mut values = vec![];
-        let mut pos = vec![];
-        let mut it = args;
-        while let Some(a) = it.next() {
-            match Flag::parse(&a) {
-                Some(Flag::Help) => return Ok(None),
-                Some(f) if f.takes_value() => {
-                    let v = it.next().ok_or_else(|| Error::Usage(format!("{} needs a value", f.name())))?;
-                    values.push((f, v));
-                }
-                Some(f) => values.push((f, String::new())),
-                None if a.starts_with("--") => return Err(Error::Usage(format!("unknown flag {a}"))),
-                None => pos.push(a),
-            }
-        }
-        let [cmd, target] = <[String; 2]>::try_from(pos)
-            .map_err(|_| Error::Usage("expected <command> <file>".into()))?;
-        let mut c = Self {
-            cmd: cmd.parse()?,
-            target: target.into(),
-            ext: String::new(),
-            tmp_root: PathBuf::new(),
-            verify: true,
-            purge: false,
-            values,
-        };
-        c.ext = c.get(Flag::Ext).unwrap_or_else(|| DEFAULT_EXT.into());
-        if c.ext.is_empty() || c.ext.contains(['/', '.']) {
-            return Err(Error::BadValue { what: Flag::Ext.name(), why: "must be non-empty, no '/' or '.'" });
-        }
-        c.tmp_root = c.get(Flag::Tmp).map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-        c.verify = !c.switch(Flag::NoVerify)?;
-        c.purge = match (c.on_cli(Flag::Purge), c.on_cli(Flag::NoPurge)) {
-            (true, true) => {
-                return Err(Error::Usage(format!("{} and {} conflict", Flag::Purge.name(), Flag::NoPurge.name())));
-            }
-            (_, true) => false,
-            _ => c.switch(Flag::Purge)?,
-        };
-        Ok(Some(c))
-    }
-
-    /// CLI value, else env var.
-    fn get(&self, f: Flag) -> Option<String> {
-        self.values
-            .iter()
-            .rev()
-            .find(|(k, _)| *k == f)
-            .map(|(_, v)| v.clone())
-            .or_else(|| f.env().and_then(|e| std::env::var(e).ok()))
-    }
-    fn on_cli(&self, f: Flag) -> bool {
-        self.values.iter().any(|(k, _)| *k == f)
-    }
-
-    /// On/off flag: present on the CLI = on; else its env var must be a SWITCH_ON/OFF word.
-    fn switch(&self, f: Flag) -> R<bool> {
-        if self.on_cli(f) {
-            return Ok(true);
-        }
-        let Some(v) = f.env().and_then(|e| std::env::var(e).ok()) else { return Ok(false) };
-        let v = v.to_ascii_lowercase();
-        if SWITCH_ON.contains(&v.as_str()) {
-            Ok(true)
-        } else if SWITCH_OFF.contains(&v.as_str()) {
-            Ok(false)
-        } else {
-            Err(Error::BadValue { what: f.env().unwrap_or_default(), why: "expected 1/0, true/false, yes/no, on/off" })
-        }
-    }
-
-    fn need(&self, f: Flag) -> R<String> {
-        self.get(f).ok_or_else(|| {
-            Error::Usage(format!("missing {} (or ${})", f.name(), f.env().unwrap_or_default()))
-        })
-    }
-
-    fn method(&self) -> R<Method> {
-        let kind: MethodKind = self.get(Flag::Method).as_deref().unwrap_or(MethodKind::Shell.name()).parse()?;
-        let m = match kind {
-            MethodKind::Dir if self.get(Flag::Rm).is_some() => {
-                return Err(Error::BadValue { what: Flag::Rm.name(), why: "only applies to the shell method" });
-            }
-            MethodKind::Dir => Method::Dir(self.need(Flag::Dir)?.into()),
-            MethodKind::Shell => {
-                Method::Shell { put: self.need(Flag::Put)?, get: self.need(Flag::Get)?, rm: self.get(Flag::Rm) }
-            }
-        };
-        m.validate()?;
-        Ok(m)
-    }
-
-    fn record_path(&self, file: &Path) -> PathBuf {
-        let mut s = file.as_os_str().to_owned();
-        s.push(format!(".{}", self.ext));
-        s.into()
-    }
-}
 
 // ---------- method ----------
 
@@ -400,28 +358,6 @@ impl Method {
         }
     }
 
-    /// Values end up as single record lines, so no newlines; dir must be absolute UTF-8
-    /// so pull works from any cwd.
-    fn validate(&self) -> R<()> {
-        let bad = |what, why| Err(Error::BadValue { what, why });
-        match self {
-            Self::Dir(d) => match d.to_str() {
-                None => bad(Flag::Dir.name(), "must be UTF-8"),
-                Some(s) if s.contains('\n') => bad(Flag::Dir.name(), "must not contain newlines"),
-                Some(_) if !d.is_absolute() => bad(Flag::Dir.name(), "must be absolute"),
-                Some(_) if !d.is_dir() => bad(Flag::Dir.name(), "is not a directory"),
-                Some(_) => Ok(()),
-            },
-            Self::Shell { put, get, rm } => {
-                if [put, get].into_iter().chain(rm).any(|c| c.contains('\n')) {
-                    bad("shell command", "must not contain newlines")
-                } else {
-                    Ok(())
-                }
-            }
-        }
-    }
-
     fn put(&self, src: &Path, id: &str) -> R<()> {
         match self {
             Self::Dir(d) => {
@@ -429,7 +365,13 @@ impl Method {
                 io::copy(&mut File::open(src)?, &mut out)?;
                 Ok(out.sync_all()?)
             }
-            Self::Shell { put, .. } => sh(put, &[(ShellVar::Src, src.as_os_str()), (ShellVar::Id, id.as_ref())]),
+            Self::Shell { put, .. } => sh(
+                put,
+                &[
+                    (ShellVar::Src, src.as_os_str()),
+                    (ShellVar::Id, id.as_ref()),
+                ],
+            ),
         }
     }
 
@@ -439,7 +381,13 @@ impl Method {
                 io::copy(&mut File::open(d.join(id))?, &mut private_file(dst)?)?;
                 Ok(())
             }
-            Self::Shell { get, .. } => sh(get, &[(ShellVar::Dst, dst.as_os_str()), (ShellVar::Id, id.as_ref())]),
+            Self::Shell { get, .. } => sh(
+                get,
+                &[
+                    (ShellVar::Dst, dst.as_os_str()),
+                    (ShellVar::Id, id.as_ref()),
+                ],
+            ),
         }
     }
 
@@ -465,7 +413,10 @@ fn sh(cmd: &str, env: &[(ShellVar, &std::ffi::OsStr)]) -> R<()> {
     if status.success() {
         Ok(())
     } else {
-        Err(Error::CommandFailed { cmd: cmd.into(), status })
+        Err(Error::CommandFailed {
+            cmd: cmd.into(),
+            status,
+        })
     }
 }
 
@@ -489,7 +440,11 @@ struct Meta {
 }
 impl Meta {
     fn of(m: &fs::Metadata) -> Self {
-        Self { mode: Some(m.permissions().mode() & MODE_MASK), mtime: m.modified().ok(), atime: m.accessed().ok() }
+        Self {
+            mode: Some(m.permissions().mode() & MODE_MASK),
+            mtime: m.modified().ok(),
+            atime: m.accessed().ok(),
+        }
     }
 
     /// Apply to an open file; call after the last write so mtime sticks.
@@ -509,14 +464,25 @@ impl Meta {
 
     fn encode(&self, lines: &mut Vec<(Field, String)>) {
         lines.extend(self.mode.map(|m| (Field::Mode, format!("{m:o}"))));
-        lines.extend(self.mtime.map(|t| (Field::Mtime, time_to_nanos(t).to_string())));
-        lines.extend(self.atime.map(|t| (Field::Atime, time_to_nanos(t).to_string())));
+        lines.extend(
+            self.mtime
+                .map(|t| (Field::Mtime, time_to_nanos(t).to_string())),
+        );
+        lines.extend(
+            self.atime
+                .map(|t| (Field::Atime, time_to_nanos(t).to_string())),
+        );
     }
 
     fn decode<'a>(field: impl Fn(Field) -> Option<&'a str>) -> R<Self> {
         let time = |f| {
             field(f)
-                .map(|v| v.parse::<i128>().ok().and_then(nanos_to_time).ok_or(Error::Record("malformed time")))
+                .map(|v| {
+                    v.parse::<i128>()
+                        .ok()
+                        .and_then(nanos_to_time)
+                        .ok_or(Error::Record("malformed time"))
+                })
                 .transpose()
         };
         let mode = field(Field::Mode)
@@ -525,7 +491,11 @@ impl Meta {
                 _ => Err(Error::Record("malformed mode")),
             })
             .transpose()?;
-        Ok(Self { mode, mtime: time(Field::Mtime)?, atime: time(Field::Atime)? })
+        Ok(Self {
+            mode,
+            mtime: time(Field::Mtime)?,
+            atime: time(Field::Atime)?,
+        })
     }
 }
 
@@ -539,7 +509,11 @@ fn time_to_nanos(t: SystemTime) -> i128 {
 
 fn nanos_to_time(n: i128) -> Option<SystemTime> {
     let d = Duration::from_nanos(u64::try_from(n.unsigned_abs()).ok()?);
-    if n >= 0 { UNIX_EPOCH.checked_add(d) } else { UNIX_EPOCH.checked_sub(d) }
+    if n >= 0 {
+        UNIX_EPOCH.checked_add(d)
+    } else {
+        UNIX_EPOCH.checked_sub(d)
+    }
 }
 impl Record {
     fn encode(&self) -> SecretString {
@@ -550,7 +524,7 @@ impl Record {
             (Field::Method, self.method.kind().name().to_string()),
         ];
         match &self.method {
-            // validate() guaranteed UTF-8.
+            // parse_dir accepted it from a &str, so it's UTF-8.
             Method::Dir(d) => lines.push((Field::Dir, d.to_string_lossy().into_owned())),
             Method::Shell { get, rm, .. } => {
                 lines.push((Field::Get, get.clone()));
@@ -568,11 +542,21 @@ impl Record {
     fn decode(body: &str) -> R<Self> {
         let mut map: Vec<(Field, &str)> = vec![];
         for line in body.lines() {
-            let (k, v) = line.split_once(RECORD_SEP).ok_or(Error::Record("line without separator"))?;
-            let f = Field::ALL.into_iter().find(|f| f.name() == k).ok_or(Error::Record("unknown field"))?;
+            let (k, v) = line
+                .split_once(RECORD_SEP)
+                .ok_or(Error::Record("line without separator"))?;
+            let f = Field::ALL
+                .into_iter()
+                .find(|f| f.name() == k)
+                .ok_or(Error::Record("unknown field"))?;
             map.push((f, v));
         }
-        let field = |f: Field| map.iter().find(|(k, _)| *k == f).map(|(_, v)| *v).ok_or(Error::Record("missing field"));
+        let field = |f: Field| {
+            map.iter()
+                .find(|(k, _)| *k == f)
+                .map(|(_, v)| *v)
+                .ok_or(Error::Record("missing field"))
+        };
         if field(Field::Magic)? != RECORD_MAGIC {
             return Err(Error::Record("unsupported version"));
         }
@@ -580,8 +564,12 @@ impl Record {
         if id.len() != ID_BYTES * 2 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(Error::Record("malformed id"));
         }
-        let key = field(Field::Key)?.parse().map_err(|_| Error::Record("malformed key"))?;
-        let method = match field(Field::Method)?.parse::<MethodKind>().map_err(|_| Error::Record("unknown method"))? {
+        let key = field(Field::Key)?
+            .parse()
+            .map_err(|_| Error::Record("malformed key"))?;
+        let method = match MethodKind::parse(field(Field::Method)?)
+            .ok_or(Error::Record("unknown method"))?
+        {
             MethodKind::Dir => Method::Dir(field(Field::Dir)?.into()),
             // put isn't needed to retrieve, so it isn't stored.
             MethodKind::Shell => Method::Shell {
@@ -591,56 +579,80 @@ impl Record {
             },
         };
         let meta = Meta::decode(|f| field(f).ok())?;
-        Ok(Self { id, key, method, meta })
+        Ok(Self {
+            id,
+            key,
+            method,
+            meta,
+        })
     }
 }
 
 // ---------- commands ----------
 
-fn push(cfg: &Config) -> R<()> {
-    let file = &cfg.target;
+fn push(common: &Common, args: &PushArgs) -> R<()> {
+    let file = &args.file;
     let file_meta = fs::metadata(file)?;
     if !file_meta.is_file() {
         return Err(Error::NotRegularFile(file.clone()));
     }
-    let record_path = cfg.record_path(file);
+    let record_path = common.record_path(file);
     if record_path.exists() {
         return Err(Error::Exists(record_path));
     }
-    let method = cfg.method()?;
+    let method = args.method()?;
     let pass = passphrase(true)?;
-    let rec = Record { id: random_id()?, key: age::x25519::Identity::generate(), method, meta: Meta::of(&file_meta) };
-    let tmp = TmpDir::new(&cfg.tmp_root, &rec.id)?;
+    let rec = Record {
+        id: random_id()?,
+        key: age::x25519::Identity::generate(),
+        method,
+        meta: Meta::of(&file_meta),
+    };
+    let tmp = scratch_dir(&common.tmp)?;
 
-    let blob = tmp.0.join(BLOB_NAME);
+    let blob = tmp.path().join(BLOB_NAME);
     let recipient = rec.key.to_public();
-    let mut w = age::Encryptor::with_recipients(std::iter::once(&recipient as _))?.wrap_output(private_file(&blob)?)?;
+    let mut w = age::Encryptor::with_recipients(std::iter::once(&recipient as _))?
+        .wrap_output(private_file(&blob)?)?;
     io::copy(&mut File::open(file)?, &mut w)?;
     w.finish()?.sync_all()?;
 
     rec.method.put(&blob, &rec.id)?;
 
-    if cfg.verify {
-        let back = tmp.0.join(VERIFY_NAME);
+    if !args.no_verify {
+        let back = tmp.path().join(VERIFY_NAME);
         rec.method.get(&back, &rec.id)?;
-        if !same(&mut decrypt(&back, &rec.key)?, &mut BufReader::new(File::open(file)?))? {
+        if !same(
+            &mut decrypt(&back, &rec.key)?,
+            &mut BufReader::new(File::open(file)?),
+        )? {
             return Err(Error::VerifyMismatch);
         }
     }
 
     // Record durable on disk before the original goes away.
-    let mut w = age::Encryptor::with_user_passphrase(pass).wrap_output(private_file(&record_path)?)?;
+    let mut w =
+        age::Encryptor::with_user_passphrase(pass).wrap_output(private_file(&record_path)?)?;
     w.write_all(rec.encode().expose_secret().as_bytes())?;
     w.finish()?.sync_all()?;
     fs::remove_file(file)?;
-    println!("offloaded {} -> {} (id {})", file.display(), record_path.display(), rec.id);
+    println!(
+        "offloaded {} -> {} (id {})",
+        file.display(),
+        record_path.display(),
+        rec.id
+    );
     Ok(())
 }
 
-fn pull(cfg: &Config) -> R<()> {
-    let record_path = &cfg.target;
-    if record_path.extension().is_none_or(|e| e != cfg.ext.as_str()) {
-        return Err(Error::WrongExtension(cfg.ext.clone()));
+fn pull(common: &Common, args: &PullArgs) -> R<()> {
+    let record_path = &args.record;
+    let purge = args.purge && !args.no_purge;
+    if record_path
+        .extension()
+        .is_none_or(|e| e != common.ext.as_str())
+    {
+        return Err(Error::WrongExtension(common.ext.clone()));
     }
     let out = record_path.with_extension("");
     if out.exists() {
@@ -652,39 +664,45 @@ fn pull(cfg: &Config) -> R<()> {
         .decrypt(std::iter::once(&age::scrypt::Identity::new(pass) as _))?
         .read_to_string(&mut body)?;
     let mut rec = Record::decode(&body)?;
-    if let (Method::Shell { rm, .. }, Some(over)) = (&mut rec.method, cfg.get(Flag::Rm)) {
+    if let (Method::Shell { rm, .. }, Some(over)) = (&mut rec.method, args.rm.clone()) {
         *rm = Some(over);
-        rec.method.validate()?;
     }
     // Fail before touching anything if purge can't be honored.
-    if cfg.purge && !rec.method.can_remove() {
+    if purge && !rec.method.can_remove() {
         return Err(Error::NoRemover);
     }
 
-    let tmp = TmpDir::new(&cfg.tmp_root, &rec.id)?;
-    let blob = tmp.0.join(BLOB_NAME);
+    let tmp = scratch_dir(&common.tmp)?;
+    let blob = tmp.path().join(BLOB_NAME);
     rec.method.get(&blob, &rec.id)?;
 
-    // AEAD fails on any tampering/truncation, so rename only happens for authentic plaintext.
-    let mut partial = out.clone().into_os_string();
-    partial.push(PARTIAL_SUFFIX);
-    let partial = PathBuf::from(partial);
-    let res = (|| -> R<()> {
-        let mut w = private_file(&partial)?;
-        io::copy(&mut decrypt(&blob, &rec.key)?, &mut w)?;
-        rec.meta.apply(&w)?;
-        Ok(w.sync_all()?)
-    })();
-    if let Err(e) = res {
-        let _ = fs::remove_file(&partial);
-        return Err(e);
-    }
-    fs::rename(&partial, &out)?;
+    // AEAD fails on any tampering/truncation, so only authentic plaintext gets persisted.
+    // The temp file (0600) is deleted on drop if anything fails before that.
+    let dir = out
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let mut w = tempfile::Builder::new()
+        .prefix(PARTIAL_PREFIX)
+        .permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))
+        .tempfile_in(dir)?;
+    io::copy(&mut decrypt(&blob, &rec.key)?, &mut w)?;
+    rec.meta.apply(w.as_file())?;
+    w.as_file().sync_all()?;
+    // No-clobber: if something created `out` since the check above, fail instead of overwriting.
+    w.persist_noclobber(&out)
+        .map_err(|e| match e.error.kind() {
+            io::ErrorKind::AlreadyExists => Error::Exists(out.clone()),
+            _ => e.error.into(),
+        })?;
     fs::remove_file(record_path)?;
     println!("restored {}", out.display());
     // Only after the plaintext is safely in place.
-    if cfg.purge {
-        rec.method.remove(&rec.id).map_err(|e| Error::RemoteKept { id: rec.id.clone(), cause: Box::new(e) })?;
+    if purge {
+        rec.method.remove(&rec.id).map_err(|e| Error::RemoteKept {
+            id: rec.id.clone(),
+            cause: Box::new(e),
+        })?;
         println!("removed remote copy {}", rec.id);
     }
     Ok(())
@@ -697,8 +715,12 @@ fn decrypt(p: &Path, key: &age::x25519::Identity) -> R<impl Read> {
 }
 
 fn passphrase(confirm: bool) -> R<SecretString> {
-    if let Ok(p) = std::env::var(ENV_PASSPHRASE) {
-        return if p.is_empty() { Err(Error::EmptyPassphrase) } else { Ok(p.into()) };
+    if let Ok(p) = std::env::var(env::PASSPHRASE) {
+        return if p.is_empty() {
+            Err(Error::EmptyPassphrase)
+        } else {
+            Ok(p.into())
+        };
     }
     let p = rpassword::prompt_password(PROMPT_PASS)?;
     if p.is_empty() {
@@ -717,7 +739,11 @@ fn random_id() -> R<String> {
 }
 
 fn private_file(p: &Path) -> io::Result<File> {
-    OpenOptions::new().write(true).create_new(true).mode(PRIVATE_FILE_MODE).open(p)
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(PRIVATE_FILE_MODE)
+        .open(p)
 }
 
 fn same(a: &mut impl Read, b: &mut impl Read) -> io::Result<bool> {
@@ -744,53 +770,26 @@ fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     Ok(n)
 }
 
-/// Private scratch dir, removed on drop (including error paths).
-struct TmpDir(PathBuf);
-impl TmpDir {
-    fn new(root: &Path, id: &str) -> io::Result<Self> {
-        let p = root.join(format!("{TMP_PREFIX}{id}"));
-        fs::DirBuilder::new().mode(PRIVATE_DIR_MODE).create(&p)?;
-        Ok(Self(p))
-    }
-}
-impl Drop for TmpDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
-    }
-}
-
-fn usage() -> String {
-    let flags = Flag::ALL
-        .iter()
-        .map(|f| match f.env() {
-            Some(e) => format!("  {:<12} ${e}", f.name()),
-            None => format!("  {}", f.name()),
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    let cmds = Cmd::ALL.map(Cmd::name).join("|");
-    let methods = [MethodKind::Dir, MethodKind::Shell].map(MethodKind::name).join("|");
-    format!(
-        "usage: {PROGRAM} {cmds} <file> [flags]\nmethods: {methods}\nshell vars: ${} ${} ${}\npassphrase: ${ENV_PASSPHRASE} or prompt\nflags (env fallback):\n{flags}",
-        ShellVar::Src.name(),
-        ShellVar::Dst.name(),
-        ShellVar::Id.name()
-    )
+/// Private (0700) scratch dir with a random name, removed on drop (including error paths).
+fn scratch_dir(root: &Path) -> io::Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix(TMP_PREFIX)
+        .permissions(fs::Permissions::from_mode(PRIVATE_DIR_MODE))
+        .tempdir_in(root)
 }
 
 fn main() {
-    let res = Config::parse(std::env::args().skip(1)).and_then(|c| match c {
-        None => {
-            println!("{}", usage());
-            Ok(())
+    let cli = Cli::parse();
+    let res = match &cli.cmd {
+        Cmd::Push(a) => push(&cli.common, a),
+        Cmd::Pull(a) => pull(&cli.common, a),
+    };
+    match res {
+        Ok(()) => {}
+        Err(Error::Cli(e)) => e.exit(),
+        Err(e) => {
+            eprintln!("{PROGRAM}: {e}");
+            std::process::exit(1);
         }
-        Some(c) => match c.cmd {
-            Cmd::Push => push(&c),
-            Cmd::Pull => pull(&c),
-        },
-    });
-    if let Err(e) = res {
-        eprintln!("{PROGRAM}: {e}");
-        std::process::exit(1);
     }
 }
