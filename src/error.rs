@@ -28,7 +28,11 @@ pub enum Error {
     CommandFailed { cmd: String, status: ExitStatus },
     #[error("verify failed: fetched copy differs; original untouched")]
     VerifyMismatch,
-    #[error("--{purge} with the shell method needs --{rm} (at push or pull)", purge = flag::PURGE, rm = flag::RM)]
+    #[error(
+        "--{purge} with the shell method needs --{rm} (at push or pull)",
+        purge = flag::PURGE,
+        rm = flag::RM
+    )]
     NoRemover,
     #[error("file restored, but remote copy {id} was not removed: {cause}")]
     RemoteKept { id: String, cause: Box<Error> },

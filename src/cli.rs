@@ -21,10 +21,21 @@ pub struct Cli {
 #[derive(Args)]
 pub struct Common {
     /// Record file extension
-    #[arg(long = flag::EXT, env = env::EXT, default_value = DEFAULT_EXT, value_parser = parse_ext, global = true)]
+    #[arg(
+        long = flag::EXT,
+        env = env::EXT,
+        default_value = DEFAULT_EXT,
+        value_parser = parse_ext,
+        global = true
+    )]
     pub ext: String,
     /// Root for private scratch dirs
-    #[arg(long = flag::TMP, env = env::TMP, global = true, default_value_os_t = std::env::temp_dir())]
+    #[arg(
+        long = flag::TMP,
+        env = env::TMP,
+        global = true,
+        default_value_os_t = std::env::temp_dir()
+    )]
     pub tmp: PathBuf,
 }
 
@@ -40,10 +51,21 @@ pub enum Cmd {
 pub struct PushArgs {
     pub file: PathBuf,
     /// How the blob leaves the machine
-    #[arg(id = flag::METHOD, long = flag::METHOD, env = env::METHOD, value_enum, default_value_t = MethodKind::Shell)]
+    #[arg(
+        id = flag::METHOD,
+        long = flag::METHOD,
+        env = env::METHOD,
+        value_enum,
+        default_value_t = MethodKind::Shell
+    )]
     pub method: MethodKind,
     /// Target directory (absolute) for the dir method
-    #[arg(long = flag::DIR, env = env::DIR, value_parser = parse_dir, required_if_eq(flag::METHOD, METHOD_DIR))]
+    #[arg(
+        long = flag::DIR,
+        env = env::DIR,
+        value_parser = parse_dir,
+        required_if_eq(flag::METHOD, METHOD_DIR)
+    )]
     pub dir: Option<PathBuf>,
     /// Upload command (shell method)
     #[arg(long = flag::PUT, env = env::PUT, value_parser = parse_cmd)]
@@ -55,7 +77,12 @@ pub struct PushArgs {
     #[arg(long = flag::RM, env = env::RM, value_parser = parse_cmd)]
     pub rm: Option<String>,
     /// Skip downloading the copy back to verify it before deleting the original
-    #[arg(long = flag::NO_VERIFY, env = env::NO_VERIFY, action = ArgAction::SetTrue, value_parser = BoolishValueParser::new())]
+    #[arg(
+        long = flag::NO_VERIFY,
+        env = env::NO_VERIFY,
+        action = ArgAction::SetTrue,
+        value_parser = BoolishValueParser::new()
+    )]
     pub no_verify: bool,
 }
 
@@ -63,7 +90,12 @@ pub struct PushArgs {
 pub struct PullArgs {
     pub record: PathBuf,
     /// Delete the remote copy after a successful restore
-    #[arg(long = flag::PURGE, env = env::PURGE, action = ArgAction::SetTrue, value_parser = BoolishValueParser::new())]
+    #[arg(
+        long = flag::PURGE,
+        env = env::PURGE,
+        action = ArgAction::SetTrue,
+        value_parser = BoolishValueParser::new()
+    )]
     pub purge: bool,
     /// Keep the remote copy; always wins over --purge / $OFFLOADER_PURGE
     #[arg(long = flag::NO_PURGE, action = ArgAction::SetTrue)]
@@ -103,7 +135,8 @@ fn parse_cmd(s: &str) -> Result<String, String> {
 
 fn after_help() -> String {
     format!(
-        "Shell commands run under `{SHELL} {SHELL_FLAG}` with ${}, ${}, ${} in the env.\nPassphrase: ${} or prompt.",
+        "Shell commands run under `{SHELL} {SHELL_FLAG}` with ${}, ${}, ${} in the env.\n\
+         Passphrase: ${} or prompt.",
         ShellVar::Src.name(),
         ShellVar::Dst.name(),
         ShellVar::Id.name(),
