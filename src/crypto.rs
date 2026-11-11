@@ -20,11 +20,11 @@ pub fn passphrase(confirm: bool) -> R<SecretString> {
             Ok(p.into())
         };
     }
-    let p = rpassword::prompt_password(PROMPT_PASS)?;
+    let p = rpassword::prompt_password(PROMPT_PASS).map_err(Error::NoPassphrase)?;
     if p.is_empty() {
         return Err(Error::EmptyPassphrase);
     }
-    if confirm && rpassword::prompt_password(PROMPT_CONFIRM)? != p {
+    if confirm && rpassword::prompt_password(PROMPT_CONFIRM).map_err(Error::NoPassphrase)? != p {
         return Err(Error::PassphraseMismatch);
     }
     Ok(p.into())

@@ -7,6 +7,9 @@ license = "Apache-2.0"
 description = "Offload a file elsewhere and leave an encrypted retrieval record in its place"
 repository = "https://github.com/jakeuribe/offloader"
 readme = "README.md"
+exclude = [".github", ".cargo", "test.sh"]
+keywords = ["encryption", "backup", "age", "cli"]
+categories = ["command-line-utilities", "cryptography"]
 
 [dependencies]
 age = "0.12"

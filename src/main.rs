@@ -25,6 +25,7 @@ fn main() {
     let res = match &cli.cmd {
         Cmd::Push(a) => push::push(&cli.common, a),
         Cmd::Pull(a) => pull::pull(&cli.common, a),
+        Cmd::Rm(a) => pull::rm(&cli.common, a),
     };
     match res {
         Ok(()) => {}

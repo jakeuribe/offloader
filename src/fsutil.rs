@@ -47,3 +47,25 @@ fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     }
     Ok(n)
 }
+
+/// Directory containing `p` (`.` for a bare file name).
+pub fn parent(p: &Path) -> &Path {
+    p.parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+/// Byte count for humans: `512 B`, `1.5 GiB`.
+pub fn human(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let (mut v, mut i) = (n as f64, 0);
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}

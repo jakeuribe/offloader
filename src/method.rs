@@ -7,9 +7,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::error::{Error, R};
+use crate::error::{At, Error, R};
 use crate::fsutil::private_file;
-use crate::vocab::{METHOD_DIR, METHOD_SHELL, SHELL, SHELL_FLAG};
+use crate::vocab::{METHOD_DIR, METHOD_SHELL, SHELL, SHELL_FLAG, flag};
 
 #[derive(Clone, Copy, ValueEnum)]
 pub enum MethodKind {
@@ -70,11 +70,19 @@ impl Method {
     pub fn put(&self, src: &Path, id: &str) -> R<()> {
         match self {
             Self::Dir(d) => {
-                let mut out = private_file(&d.join(id))?;
-                io::copy(&mut File::open(src)?, &mut out)?;
-                Ok(out.sync_all()?)
+                let to = d.join(id);
+                let mut out = private_file(&to).at(&to)?;
+                let copied = File::open(src)
+                    .and_then(|mut f| io::copy(&mut f, &mut out))
+                    .and_then(|_| out.sync_all());
+                if copied.is_err() {
+                    // We created it just above; don't leave half a blob behind.
+                    let _ = fs::remove_file(&to);
+                }
+                copied.at(&to)
             }
             Self::Shell { put, .. } => sh(
+                flag::PUT,
                 put,
                 &[
                     (ShellVar::Src, src.as_os_str()),
@@ -87,10 +95,15 @@ impl Method {
     pub fn get(&self, dst: &Path, id: &str) -> R<()> {
         match self {
             Self::Dir(d) => {
-                io::copy(&mut File::open(d.join(id))?, &mut private_file(dst)?)?;
+                let from = d.join(id);
+                io::copy(
+                    &mut File::open(&from).at(&from)?,
+                    &mut private_file(dst).at(dst)?,
+                )?;
                 Ok(())
             }
             Self::Shell { get, .. } => sh(
+                flag::GET,
                 get,
                 &[
                     (ShellVar::Dst, dst.as_os_str()),
@@ -106,15 +119,24 @@ impl Method {
 
     pub fn remove(&self, id: &str) -> R<()> {
         match self {
-            Self::Dir(d) => Ok(fs::remove_file(d.join(id))?),
-            Self::Shell { rm: Some(rm), .. } => sh(rm, &[(ShellVar::Id, id.as_ref())]),
+            Self::Dir(d) => {
+                let p = d.join(id);
+                match fs::remove_file(&p) {
+                    // Already gone is the goal; lets `rm` finish a half-done removal. Only if
+                    // the directory is there: a moved or deleted one hasn't lost the blob.
+                    // (An empty mount point left by an unmounted disk still looks "gone".)
+                    Err(e) if e.kind() == io::ErrorKind::NotFound && d.is_dir() => Ok(()),
+                    r => r.at(&p),
+                }
+            }
+            Self::Shell { rm: Some(rm), .. } => sh(flag::RM, rm, &[(ShellVar::Id, id.as_ref())]),
             Self::Shell { rm: None, .. } => Err(Error::NoRemover),
         }
     }
 }
 
 /// Values go in via env, never spliced into the command string, so they can't inject shell.
-fn sh(cmd: &str, env: &[(ShellVar, &OsStr)]) -> R<()> {
+fn sh(step: &'static str, cmd: &str, env: &[(ShellVar, &OsStr)]) -> R<()> {
     let status = Command::new(SHELL)
         .arg(SHELL_FLAG)
         .arg(cmd)
@@ -124,6 +146,7 @@ fn sh(cmd: &str, env: &[(ShellVar, &OsStr)]) -> R<()> {
         Ok(())
     } else {
         Err(Error::CommandFailed {
+            step,
             cmd: cmd.into(),
             status,
         })

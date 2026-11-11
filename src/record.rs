@@ -78,6 +78,16 @@ impl Meta {
         }
     }
 
+    /// Whether `m` looks like the file pull restored from this record: a regular file
+    /// carrying the recorded mtime (pull sets it exactly; 2s slack for coarse filesystems).
+    /// ponytail: mtime only, the record holds no size or hash; add one if this proves weak.
+    pub fn restored_as(&self, m: &fs::Metadata) -> bool {
+        let (Some(want), Ok(got)) = (self.mtime, m.modified()) else {
+            return false;
+        };
+        m.is_file() && (time_to_nanos(want) - time_to_nanos(got)).abs() <= 2_000_000_000
+    }
+
     /// Apply to an open file; call after the last write so mtime sticks.
     pub fn apply(&self, f: &File) -> io::Result<()> {
         if let Some(mode) = self.mode {

@@ -5,7 +5,8 @@ pub const RECORD_MAGIC: &str = "offloader-v1";
 pub const DEFAULT_EXT: &str = "offload";
 /// Hidden temp file next to the restore target, renamed into place when complete.
 pub const PARTIAL_PREFIX: &str = ".offloader-partial-";
-pub const TMP_PREFIX: &str = "offloader-";
+/// Hidden: scratch dirs default to living next to the file being moved.
+pub const TMP_PREFIX: &str = ".offloader-tmp-";
 pub const BLOB_NAME: &str = "blob";
 pub const VERIFY_NAME: &str = "verify";
 pub const SHELL: &str = "sh";
@@ -35,6 +36,7 @@ pub mod flag {
     pub const NO_VERIFY: &str = "no-verify";
     pub const PURGE: &str = "purge";
     pub const NO_PURGE: &str = "no-purge";
+    pub const FORCE: &str = "force";
 }
 
 /// Env var fallbacks for flags, plus the passphrase.

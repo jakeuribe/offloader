@@ -27,10 +27,21 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --release -- -D warnings
       - run: ./test.sh
+      # What release.yml will publish to crates.io must at least package and build.
+      - run: cargo package --locked
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-audit
       - run: cargo audit
+
+  # Cargo.toml promises a minimum Rust version; keep the promise honest.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --locked
 
   # test.sh relies on GNU stat/touch, so macOS only builds and lints.
   macos:
