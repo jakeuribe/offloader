@@ -23,3 +23,6 @@ thiserror = "2.0.21"
 lto = true
 codegen-units = 1
 strip = true
+
+[dev-dependencies]
+clap-markdown = "0.1.5"

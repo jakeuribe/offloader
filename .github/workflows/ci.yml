@@ -26,6 +26,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --release -- -D warnings
+      # Unit tests, including the check that docs/CLI.md matches the clap definitions.
+      - run: cargo test --locked
+      - run: cargo doc --no-deps --locked
+        env:
+          RUSTDOCFLAGS: -D warnings
       - run: ./test.sh
       # What release.yml will publish to crates.io must at least package and build.
       - run: cargo package --locked
