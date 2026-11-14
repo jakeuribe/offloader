@@ -51,6 +51,8 @@ The `push` flags, `--purge`, `--ext` and `--tmp` have an env fallback (`--put` â
 | `--ext EXT` | record extension |
 | `--tmp PATH` | scratch dir; defaults to the file's own directory |
 
+Full reference for every subcommand: [`docs/CLI.md`](docs/CLI.md), generated from the clap definitions (`UPDATE_DOCS=1 cargo test cli_docs` to regenerate).
+
 ## Notes
 
 - Push deletes the original only after it has re-downloaded and verified the copy and the record is on disk.
