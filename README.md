@@ -33,6 +33,8 @@ export OFFLOADER_GET='scp -q me@host:offload/$ID "$DST"'
 export OFFLOADER_RM='ssh me@host rm offload/$ID'
 ```
 
+Walkthrough with rclone: [Google Drive](docs/examples/google-drive.md).
+
 **`dir`** copies into a local directory: `--method dir --dir /mnt/nas/offload` (or `-m dir -d /mnt/nas/offload`).
 
 ## Flags
