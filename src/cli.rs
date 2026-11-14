@@ -44,7 +44,7 @@ pub struct Common {
 
 #[derive(Subcommand)]
 pub enum Cmd {
-    /// Encrypt + upload FILE, verify, then replace it with FILE.<ext>
+    /// Encrypt + upload FILE, verify, then replace it with FILE.EXT
     Push(PushArgs),
     /// Fetch + decrypt the file a record points to, restoring it in place
     Pull(PullArgs),
@@ -54,7 +54,7 @@ pub enum Cmd {
 
 #[derive(Args)]
 pub struct PushArgs {
-    /// File to offload; replaced by FILE.<ext> once the remote copy is verified
+    /// File to offload; replaced by FILE.EXT once the remote copy is verified
     pub file: PathBuf,
     /// How the blob leaves the machine
     #[arg(
@@ -97,7 +97,7 @@ pub struct PushArgs {
 
 #[derive(Args)]
 pub struct PullArgs {
-    /// Record to restore from, or the original file name if FILE.<ext> exists
+    /// Record to restore from, or the original file name if FILE.EXT exists
     pub record: PathBuf,
     // No env fallback on --rm/--get/--dir here or in `rm`: what a record stored should only
     // be overridden on purpose, not by whatever the current shell is set up to push to
@@ -234,5 +234,36 @@ impl PushArgs {
                 rm: self.rm.clone(),
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+
+    /// `docs/CLI.md` is generated from the clap definitions. Regenerate with
+    /// `UPDATE_DOCS=1 cargo test cli_docs`; CI fails if it is out of date.
+    #[test]
+    fn cli_docs() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/docs/CLI.md");
+        let opts = clap_markdown::MarkdownOptions::new().show_footer(false);
+        let raw = clap_markdown::help_markdown_custom::<Cli>(&opts);
+        // clap-markdown emits after_help verbatim; fence it so Markdown keeps its line breaks.
+        let after = super::after_help();
+        assert!(
+            raw.contains(&after),
+            "after_help not found in generated docs"
+        );
+        let fresh = raw.replace(&after, &format!("```text\n{after}\n```"));
+        if std::env::var_os("UPDATE_DOCS").is_some() {
+            std::fs::create_dir_all(std::path::Path::new(path).parent().unwrap()).unwrap();
+            std::fs::write(path, &fresh).unwrap();
+            return;
+        }
+        let current = std::fs::read_to_string(path).unwrap_or_default();
+        assert!(
+            current == fresh,
+            "docs/CLI.md is stale; run `UPDATE_DOCS=1 cargo test cli_docs`"
+        );
     }
 }

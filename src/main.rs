@@ -3,6 +3,8 @@
 //! The file is age/X25519-encrypted with a fresh key before leaving the machine; the
 //! record (key, id, method, file metadata) is age/scrypt-encrypted with your passphrase.
 //! The CLI surface lives in `cli.rs`; `offloader --help` documents it.
+#![doc = ""]
+#![doc = include_str!("../docs/CLI.md")]
 
 mod cli;
 mod crypto;

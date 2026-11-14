@@ -33,6 +33,8 @@ export OFFLOADER_GET='scp -q me@host:offload/$ID "$DST"'
 export OFFLOADER_RM='ssh me@host rm offload/$ID'
 ```
 
+Walkthrough with rclone: [Google Drive](docs/examples/google-drive.md).
+
 **`dir`** copies into a local directory: `--method dir --dir /mnt/nas/offload` (or `-m dir -d /mnt/nas/offload`).
 
 ## Flags
@@ -50,6 +52,8 @@ The `push` flags, `--purge`, `--ext` and `--tmp` have an env fallback (`--put` â
 | `rm --force` | remove the remote copy even though the restored file isn't there (or was changed since) |
 | `--ext EXT` | record extension |
 | `--tmp PATH` | scratch dir; defaults to the file's own directory |
+
+Full reference for every subcommand: [`docs/CLI.md`](docs/CLI.md), generated from the clap definitions (`UPDATE_DOCS=1 cargo test cli_docs` to regenerate).
 
 ## Notes
 
